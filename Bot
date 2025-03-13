@@ -1,0 +1,234 @@
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.TelegramBotsApi;
+import org.telegram.telegrambots.meta.api.methods.GetFile;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.Document;
+import org.telegram.telegrambots.meta.api.objects.Message;
+import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
+
+import java.io.InputStream;
+import java.net.URL;
+import java.net.URLConnection;
+
+
+public class MyTelegramBot extends TelegramLongPollingBot {
+
+    private final String botToken;
+    private final String botUsername;
+
+    public MyTelegramBot(String botToken, String botUsername) {
+        this.botToken = botToken;
+        this.botUsername = botUsername;
+    }
+
+    @Override
+    public String getBotToken() {
+        return botToken;
+    }
+
+    @Override
+    public String getBotUsername() {
+        return botUsername;
+    }
+
+    @Override
+    public void onUpdateReceived(Update update) {
+        // Перевіряємо, чи отримали ми документ (Excel-файл)
+        if (update.hasMessage() && update.getMessage().hasDocument()) {
+            Message message = update.getMessage();
+            Document document = message.getDocument();
+
+            String fileName = document.getFileName().toLowerCase();
+            if (fileName.endsWith(".xlsx") || fileName.endsWith(".xls")) {
+                handleExcelFile(message.getChatId().toString(), document);
+            } else {
+                sendTextMessage(
+                        message.getChatId().toString(),
+                        "Будь ласка, надішліть Excel-файл (.xlsx або .xls)."
+                );
+            }
+        }
+    }
+
+    /**
+     * Основна логіка: читаємо Excel, рахуємо deposit/withdraw, обчислюємо RTP
+     */
+    private void handleExcelFile(String chatId, Document document) {
+        try {
+            // 1. Отримуємо від Telegram дані про файл
+            org.telegram.telegrambots.meta.api.objects.File telegramFile =
+                    execute(new GetFile(document.getFileId()));
+            String filePath = telegramFile.getFilePath();
+
+            // 2. Формуємо URL для завантаження
+            String fileUrl = "https://api.telegram.org/file/bot" + getBotToken() + "/" + filePath;
+            URL url = new URL(fileUrl);
+            URLConnection conn = url.openConnection();
+
+            // 3. Зчитуємо Excel із потоку
+            try (InputStream inputStream = conn.getInputStream();
+                 Workbook workbook = new XSSFWorkbook(inputStream)) {
+
+                double depositSum = 0.0;
+                double withdrawSum = 0.0;
+
+                // Припускаємо, що потрібні дані в першому аркуші
+                Sheet sheet = workbook.getSheetAt(0);
+
+                // Перебираємо всі рядки
+                for (Row row : sheet) {
+                    // Пропускаємо заголовок (перший рядок), якщо там назви колонок
+                    if (row.getRowNum() == 0) {
+                        continue;
+                    }
+
+                    // --- ІНДЕКСИ КОЛОНОК (приклад) ---
+                    // F (індекс 5)  = txType (v1-deposit / v1-withdraw)
+                    // G (індекс 6)  = status (finish / rollback_finish ...)
+                    // L (індекс 11) або M (12) = action (bet / cancel_bet / ...)
+                    // N (індекс 13) або O (14) = amount (0.400 / 1.100 / ...)
+
+                    // Приклад: припустимо, що:
+                    //  txType  = 5
+                    //  status  = 6
+                    //  action  = 11
+                    //  amount  = 13
+                    Cell typeCell   = row.getCell(5);  // txType
+                    Cell statusCell = row.getCell(6);  // status
+                    Cell actionCell = row.getCell(12); // action
+                    Cell amountCell = row.getCell(14); // amount
+
+                    if (typeCell == null || statusCell == null ||
+                            actionCell == null || amountCell == null) {
+                        continue;
+                    }
+
+                    // --- Зчитуємо значення у вигляді рядка ---
+                    String originalType   = getCellValueAsString(typeCell).toLowerCase().trim();
+                    String originalStatus = getCellValueAsString(statusCell).toLowerCase().trim();
+                    String originalAction = getCellValueAsString(actionCell).toLowerCase().trim();
+                    String originalAmount = getCellValueAsString(amountCell).trim();
+
+                    // --- ДЕБАГ-ВИВІД, щоб перевірити, що зчитується ---
+                    System.out.println("Row " + row.getRowNum()
+                            + ": txType='" + originalType
+                            + "', status='" + originalStatus
+                            + "', action='" + originalAction
+                            + "', amount='" + originalAmount + "'"
+                    );
+
+                    // --- 1) Перевірка status = "finish" ---
+                    if (!"finish".equals(originalStatus)) {
+                        // Якщо статус інший, пропускаємо
+                        continue;
+                    }
+
+                    // --- 2) Перевірка action = "bet" ---
+                    if (!"bet".equals(originalAction)) {
+                        // Якщо action інший (cancel_bet, finish, тощо), пропускаємо
+                        continue;
+                    }
+
+                    // --- 3) Перевіряємо тип транзакції ---
+                    //    У файлі "v1-deposit" чи "v1-withdraw", тому перевіряємо .contains("deposit") / .contains("withdraw")
+                    boolean isDeposit  = originalType.contains("deposit");
+                    boolean isWithdraw = originalType.contains("withdraw");
+
+                    // Якщо це не deposit і не withdraw, пропускаємо
+                    if (!isDeposit && !isWithdraw) {
+                        continue;
+                    }
+
+                    // --- 4) «Зачистка» суми ---
+                    String cleanedAmount = originalAmount
+                            .replaceAll("\\s+", "")    // прибираємо зайві пробіли
+                            .replace(",", ".")         // кому → крапку
+                            .replaceAll("[^0-9.\\-]", ""); // лишаємо цифри, крапку, мінус
+
+                    double amountValue;
+                    try {
+                        amountValue = Double.parseDouble(cleanedAmount);
+                    } catch (NumberFormatException e) {
+                        // Якщо не вдалося розпарсити суму, пропускаємо рядок
+                        continue;
+                    }
+
+                    // --- 5) Підсумовуємо ---
+                    if (isDeposit) {
+                        depositSum += amountValue;
+                    } else if (isWithdraw) {
+                        withdrawSum += amountValue;
+                    }
+                }
+
+                // --- Обчислюємо RTP ---
+                if (withdrawSum == 0) {
+                    sendTextMessage(chatId,
+                            "Неможливо обчислити RTP, оскільки загальна сума withdraw = 0 (або транзакції 'withdraw' відсутні).");
+                } else {
+                    double rtp = (depositSum / withdrawSum) * 100.0;
+                    String result = String.format("RTP = %.2f%%", rtp);
+                    sendTextMessage(chatId, result);
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            sendTextMessage(chatId,
+                    "Сталася помилка при обробці файлу: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Повертає значення клітинки як рядок, незалежно від її типу.
+     */
+    private String getCellValueAsString(Cell cell) {
+        switch (cell.getCellType()) {
+            case STRING:
+                return cell.getStringCellValue();
+            case NUMERIC:
+                return String.valueOf(cell.getNumericCellValue());
+            case FORMULA:
+                try {
+                    return String.valueOf(cell.getNumericCellValue());
+                } catch (IllegalStateException e) {
+                    return cell.getStringCellValue();
+                }
+            case BLANK:
+            case _NONE:
+            case BOOLEAN:
+            default:
+                return "";
+        }
+    }
+
+    /**
+     * Відправляє текстове повідомлення користувачеві
+     */
+    private void sendTextMessage(String chatId, String text) {
+        SendMessage message = new SendMessage();
+        message.setChatId(chatId);
+        message.setText(text);
+
+        try {
+            execute(message);
+        } catch (TelegramApiException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Головний метод: запуск бота
+     */
+    public static void main(String[] args) {
+        try {
+            TelegramBotsApi botsApi = new TelegramBotsApi(DefaultBotSession.class);
+            botsApi.registerBot(new MyTelegramBot("7787270551:AAFUwryEJ9RqfcyVFJjffZnsXcGHYlhFDVE", "t.me/RTP_counting_bot"));
+        } catch (TelegramApiException e) {
+            e.printStackTrace();
+        }
+    }
+}
